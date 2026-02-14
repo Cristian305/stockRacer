@@ -16,7 +16,12 @@ const app = express();
 const PORT = process.env.PORT || 3005;
 
 // Security
-app.use(helmet({ contentSecurityPolicy: false })); // CSP off for SPA
+app.use(helmet({
+  contentSecurityPolicy: false,
+  crossOriginEmbedderPolicy: false,
+  crossOriginResourcePolicy: false,
+  crossOriginOpenerPolicy: false
+}));
 app.use(cors());
 app.use(express.json({ limit: '1kb' })); // Small payloads only
 
