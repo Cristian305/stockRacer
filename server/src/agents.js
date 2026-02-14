@@ -241,8 +241,9 @@ export class AgentManager {
   async runTradingRound() {
     console.log('[Trading] Starting trading round...');
     
-    // Get market data for all tradeable stocks
+    // Get market data AND analysis for all tradeable stocks
     const quotes = await this.marketData.getMultipleQuotes(TRADEABLE_STOCKS);
+    const analyses = await this.marketData.analyzeMultiple(TRADEABLE_STOCKS);
     const movers = await this.marketData.getTopMovers();
 
     for (const agentId of Object.keys(this.agents)) {
@@ -250,7 +251,7 @@ export class AgentManager {
       if (agent.status !== 'active') continue;
 
       try {
-        await this.executeAgentStrategy(agent, quotes, movers);
+        await this.executeAgentStrategy(agent, quotes, movers, analyses);
         
         // Record portfolio snapshot
         const value = await this.tradingEngine.calculatePortfolioValue(agentId, this.marketData);
@@ -263,250 +264,364 @@ export class AgentManager {
     console.log('[Trading] Trading round complete');
   }
 
-  async executeAgentStrategy(agent, quotes, movers) {
+  async executeAgentStrategy(agent, quotes, movers, analyses) {
     const portfolio = this.tradingEngine.getPortfolio(agent.id);
     if (!portfolio) return;
 
-    // Decide if agent will trade this round
+    // Decide if agent will trade this round (personality-based)
     if (Math.random() > agent.tradeFrequency) {
       return; // Skip this round
     }
 
+    // Every agent first checks existing positions for sells
+    await this.checkPositions(agent, portfolio, quotes, analyses);
+
     switch (agent.strategy) {
       case 'value':
-        await this.strategyValue(agent, portfolio, quotes);
+        await this.strategyValue(agent, portfolio, quotes, analyses);
         break;
       case 'meme':
-        await this.strategyMeme(agent, portfolio, quotes);
+        await this.strategyMeme(agent, portfolio, quotes, analyses);
         break;
       case 'growth':
-        await this.strategyGrowth(agent, portfolio, quotes);
+        await this.strategyGrowth(agent, portfolio, quotes, analyses);
         break;
       case 'momentum':
-        await this.strategyMomentum(agent, portfolio, quotes, movers);
+        await this.strategyMomentum(agent, portfolio, quotes, movers, analyses);
         break;
       case 'hodl':
-        await this.strategyHodl(agent, portfolio, quotes);
+        await this.strategyHodl(agent, portfolio, quotes, analyses);
         break;
       case 'scalp':
-        await this.strategyScalp(agent, portfolio, quotes);
+        await this.strategyScalp(agent, portfolio, quotes, analyses);
         break;
       case 'technical':
-        await this.strategyTechnical(agent, portfolio, quotes);
+        await this.strategyTechnical(agent, portfolio, quotes, analyses);
         break;
     }
   }
 
-  // Strategy: Value investing (buy undervalued stocks)
-  async strategyValue(agent, portfolio, quotes) {
-    // Use memory to avoid stocks that burned us
+  // Universal position checker - all agents review their holdings
+  async checkPositions(agent, portfolio, quotes, analyses) {
+    for (const [symbol, position] of Object.entries(portfolio.positions)) {
+      if (!quotes[symbol]) continue;
+      const currentPrice = quotes[symbol].price;
+      const pnlPercent = ((currentPrice - position.avgCost) / position.avgCost) * 100;
+      const analysis = analyses[symbol];
+
+      // Check memory: how have we done with this stock?
+      const sentiment = this.memory.getStockSentiment(agent.id, symbol);
+      
+      let shouldSell = false;
+      let reason = '';
+
+      // Strategy-specific sell thresholds
+      switch (agent.strategy) {
+        case 'scalp':
+          if (pnlPercent > 1.5 || pnlPercent < -1.5) { shouldSell = true; reason = pnlPercent > 0 ? 'Quick profit' : 'Quick stop-loss'; }
+          break;
+        case 'momentum':
+          if (pnlPercent < -3) { shouldSell = true; reason = 'Momentum loss cut'; }
+          if (analysis && analysis.trend === 'bearish' && pnlPercent < 0) { shouldSell = true; reason = 'Trend reversal'; }
+          break;
+        case 'value':
+          if (pnlPercent > 8) { shouldSell = true; reason = 'Value target reached'; }
+          if (pnlPercent < -7) { shouldSell = true; reason = 'Value thesis broken'; }
+          break;
+        case 'hodl':
+          // Diamond almost never sells
+          if (pnlPercent < -15) { shouldSell = true; reason = 'Even diamond hands have limits'; }
+          break;
+        case 'meme':
+          // Chaotic - sometimes panic sells
+          if (pnlPercent < -5 && Math.random() > 0.5) { shouldSell = true; reason = 'Panic sell!'; }
+          if (pnlPercent > 10) { shouldSell = true; reason = 'Taking tendies 🍗'; }
+          break;
+        case 'growth':
+          if (pnlPercent < -8) { shouldSell = true; reason = 'Growth story broken'; }
+          if (analysis && analysis.rsi > 80) { shouldSell = true; reason = 'Overbought - take profits'; }
+          break;
+        case 'technical':
+          if (analysis && analysis.rsi > 70 && pnlPercent > 0) { shouldSell = true; reason = 'RSI overbought signal'; }
+          if (analysis && analysis.signal < -30) { shouldSell = true; reason = 'Strong sell signal'; }
+          if (pnlPercent < -5) { shouldSell = true; reason = 'Technical stop-loss'; }
+          break;
+      }
+
+      // Memory check: if sentiment is very negative, more likely to sell
+      if (sentiment < -0.5 && pnlPercent < 0) {
+        shouldSell = true;
+        reason = 'Bad history with this stock';
+      }
+
+      if (shouldSell && position.shares > 0) {
+        const result = await this.tradingEngine.executeSell(agent.id, symbol, position.shares, currentPrice);
+        if (result.success) {
+          this.memory.recordTradeOutcome(agent.id, {
+            symbol, action: 'SELL', entryPrice: position.avgCost, exitPrice: currentPrice,
+            pnl: result.pnl, pnlPercent, reason,
+            lesson: pnlPercent > 0 ? `${symbol} was a winner - ${reason}` : `${symbol} was a loser - ${reason}`
+          });
+          this.memory.updateBelief(agent.id, {
+            beliefType: 'stock_sentiment', symbol,
+            value: Math.max(-1, Math.min(1, sentiment + (pnlPercent > 0 ? 0.2 : -0.3))),
+            note: `Sold at ${pnlPercent.toFixed(1)}%: ${reason}`
+          });
+          console.log(`[${agent.name}] SELL ${position.shares} ${symbol} @ $${currentPrice.toFixed(2)} (${pnlPercent > 0 ? '+' : ''}${pnlPercent.toFixed(1)}%) - ${reason}`);
+        }
+      }
+    }
+  }
+
+  // Strategy: Value investing - buys stable stocks with good fundamentals on dips
+  async strategyValue(agent, portfolio, quotes, analyses) {
     const worstStocks = this.memory.getWorstStocks(agent.id, 5).map(s => s.symbol);
     
     const candidates = agent.preferredStocks
-      .filter(s => quotes[s] && quotes[s].price) // Just need a valid quote
+      .filter(s => quotes[s] && analyses[s])
       .filter(s => !agent.avoidStocks.includes(s))
-      .filter(s => !worstStocks.includes(s)) // Memory: avoid past losers
-      .filter(s => !quotes[s].changePercent || quotes[s].changePercent < 2); // Value: don't buy overheated
+      .filter(s => !worstStocks.includes(s))
+      .map(s => ({ symbol: s, ...analyses[s], sentiment: this.memory.getStockSentiment(agent.id, s) }));
 
-    // Sort by memory sentiment (prefer stocks we've done well with)
-    candidates.sort((a, b) => {
-      const sentA = this.memory.getStockSentiment(agent.id, a);
-      const sentB = this.memory.getStockSentiment(agent.id, b);
-      return sentB - sentA;
-    });
+    // Warren looks for: low RSI (oversold), bearish/neutral trend (buy the dip), low volatility
+    const scored = candidates.map(c => ({
+      ...c,
+      score: (c.rsi < 40 ? 30 : c.rsi < 50 ? 15 : -10) +
+             (c.trend === 'bearish' ? 20 : c.trend === 'neutral' ? 10 : -5) + // Buy when others are fearful
+             (c.volatility < 2 ? 15 : c.volatility < 3 ? 5 : -10) +
+             (c.signal > 0 ? c.signal * 0.3 : 0) +
+             (c.sentiment > 0 ? c.sentiment * 15 : c.sentiment * 10) +
+             (c.dailyChange < -1 ? 20 : 0) // Buy on red days
+    })).sort((a, b) => b.score - a.score);
 
-    if (candidates.length > 0 && portfolio.cash > 1) {
-      const symbol = candidates[0] || candidates[Math.floor(Math.random() * candidates.length)];
-      const price = quotes[symbol].price;
-      const shares = Math.round((portfolio.cash * 0.3) / price * 10000) / 10000;
-      
+    if (scored.length > 0 && scored[0].score > 10 && portfolio.cash > 1) {
+      const pick = scored[0];
+      const shares = Math.round((portfolio.cash * 0.3) / pick.price * 10000) / 10000;
       if (shares > 0) {
-        const result = await this.tradingEngine.executeBuy(agent.id, symbol, shares, price);
+        const result = await this.tradingEngine.executeBuy(agent.id, pick.symbol, shares, pick.price);
         if (result.success) {
           this.memory.addObservation(agent.id, {
-            symbol, observation: `Bought ${symbol} at $${price.toFixed(2)} - low P/E value play`, confidence: 0.6
+            symbol: pick.symbol,
+            observation: `Bought at $${pick.price.toFixed(2)} | RSI:${pick.rsi.toFixed(0)} trend:${pick.trend} signal:${pick.signal.toFixed(0)} | Score:${pick.score.toFixed(0)}`,
+            confidence: Math.min(0.9, pick.score / 100)
           });
-          console.log(`[${agent.name}] Bought ${shares} ${symbol} @ $${price.toFixed(2)}`);
+          console.log(`[${agent.name}] 🧓 Value buy: ${shares} ${pick.symbol} @ $${pick.price.toFixed(2)} (RSI:${pick.rsi.toFixed(0)}, score:${pick.score.toFixed(0)})`);
         }
       }
+    } else if (scored.length > 0) {
+      console.log(`[${agent.name}] 🧓 Waiting... best score: ${scored[0].symbol} (${scored[0].score.toFixed(0)}) - not compelling enough`);
     }
   }
 
-  // Strategy: Meme stocks (YOLO)
-  async strategyMeme(agent, portfolio, quotes) {
-    const memeStocks = agent.preferredStocks.filter(s => quotes[s]);
-    
-    if (memeStocks.length > 0 && portfolio.cash > 1) {
-      // Random YOLO buy
-      if (Math.random() > 0.4) {
-        const symbol = memeStocks[Math.floor(Math.random() * memeStocks.length)];
-        const price = quotes[symbol].price;
-        const shares = Math.round((portfolio.cash * (0.3 + Math.random() * 0.5)) / price * 10000) / 10000;
-        
-        if (shares > 0) {
-          await this.tradingEngine.executeBuy(agent.id, symbol, shares, price);
-          console.log(`[${agent.name}] 🚀 YOLO'd ${shares} ${symbol} @ $${price.toFixed(2)}`);
-        }
-      }
-    }
+  // Strategy: Meme/YOLO - high risk, follows hype, buys volatile stocks
+  async strategyMeme(agent, portfolio, quotes, analyses) {
+    const memeStocks = agent.preferredStocks
+      .filter(s => quotes[s] && analyses[s])
+      .map(s => ({ symbol: s, ...analyses[s] }));
 
-    // Sometimes panic sell (Elon is chaotic)
-    const positions = Object.entries(portfolio.positions);
-    if (positions.length > 0 && Math.random() > 0.7) {
-      const [symbol, position] = positions[Math.floor(Math.random() * positions.length)];
-      if (quotes[symbol]) {
-        const sellShares = Math.round(position.shares * Math.random() * 10000) / 10000 || position.shares;
-        await this.tradingEngine.executeSell(agent.id, symbol, sellShares, quotes[symbol].price);
-        console.log(`[${agent.name}] Panic sold ${sellShares} ${symbol}`);
-      }
-    }
-  }
+    // Elon loves: high volatility, big moves, momentum
+    const scored = memeStocks.map(c => ({
+      ...c,
+      score: (c.volatility > 3 ? 30 : c.volatility > 2 ? 15 : 0) + // Love volatility
+             (Math.abs(c.dailyChange) > 3 ? 25 : Math.abs(c.dailyChange) > 1 ? 10 : 0) + // Big moves
+             (c.weekChange > 5 ? 20 : c.weekChange < -5 ? 15 : 0) + // Either direction = excitement
+             (Math.random() * 30) // Chaos factor 🎲
+    })).sort((a, b) => b.score - a.score);
 
-  // Strategy: Growth stocks
-  async strategyGrowth(agent, portfolio, quotes) {
-    const growthStocks = agent.preferredStocks.filter(s => 
-      quotes[s] && !agent.avoidStocks.includes(s)
-    );
-
-    if (growthStocks.length > 0 && portfolio.cash > 1) {
-      const symbol = growthStocks[Math.floor(Math.random() * growthStocks.length)];
-      const price = quotes[symbol].price;
-      const shares = Math.round((portfolio.cash * 0.25) / price * 10000) / 10000;
+    if (scored.length > 0 && portfolio.cash > 1) {
+      const pick = scored[0];
+      // YOLO sizing: 30-80% of cash
+      const sizePct = 0.3 + Math.random() * 0.5;
+      const shares = Math.round((portfolio.cash * sizePct) / pick.price * 10000) / 10000;
       
       if (shares > 0) {
-        await this.tradingEngine.executeBuy(agent.id, symbol, shares, price);
-        console.log(`[${agent.name}] Innovation buy: ${shares} ${symbol}`);
+        const result = await this.tradingEngine.executeBuy(agent.id, pick.symbol, shares, pick.price);
+        if (result.success) {
+          this.memory.addObservation(agent.id, {
+            symbol: pick.symbol,
+            observation: `🚀 YOLO @ $${pick.price.toFixed(2)} | vol:${pick.volatility.toFixed(1)}% daily:${pick.dailyChange.toFixed(1)}% | CHAOS SCORE: ${pick.score.toFixed(0)}`,
+            confidence: 0.4
+          });
+          console.log(`[${agent.name}] 🚀 YOLO ${shares} ${pick.symbol} @ $${pick.price.toFixed(2)} (vol:${pick.volatility.toFixed(1)}%, chaos:${pick.score.toFixed(0)})`);
+        }
       }
     }
   }
 
-  // Strategy: Momentum (chase winners)
-  async strategyMomentum(agent, portfolio, quotes, movers) {
-    // Buy top gainers
-    if (movers.gainers.length > 0 && portfolio.cash > 1) {
-      const winner = movers.gainers[Math.floor(Math.random() * Math.min(3, movers.gainers.length))];
-      const price = winner.price;
-      const shares = Math.round((portfolio.cash * 0.4) / price * 10000) / 10000;
-      
+  // Strategy: Growth - buys innovation stocks in uptrends
+  async strategyGrowth(agent, portfolio, quotes, analyses) {
+    const growthStocks = agent.preferredStocks
+      .filter(s => quotes[s] && analyses[s] && !agent.avoidStocks.includes(s))
+      .map(s => ({ symbol: s, ...analyses[s], sentiment: this.memory.getStockSentiment(agent.id, s) }));
+
+    // Cathy looks for: bullish trend, above moving averages, positive momentum
+    const scored = growthStocks.map(c => ({
+      ...c,
+      score: (c.trend === 'bullish' ? 30 : c.trend === 'neutral' ? 5 : -20) +
+             (c.aboveWeekAvg ? 15 : -10) +
+             (c.aboveMonthAvg ? 15 : -10) +
+             (c.weekChange > 0 ? c.weekChange * 2 : c.weekChange) +
+             (c.rsi > 40 && c.rsi < 65 ? 15 : -5) + // Not overbought, not dead
+             (c.sentiment > 0 ? c.sentiment * 20 : 0)
+    })).sort((a, b) => b.score - a.score);
+
+    if (scored.length > 0 && scored[0].score > 15 && portfolio.cash > 1) {
+      const pick = scored[0];
+      const shares = Math.round((portfolio.cash * 0.25) / pick.price * 10000) / 10000;
       if (shares > 0) {
-        await this.tradingEngine.executeBuy(agent.id, winner.symbol, shares, price);
-        console.log(`[${agent.name}] 🦈 Chasing winner: ${shares} ${winner.symbol} (+${winner.changePercent.toFixed(1)}%)`);
-      }
-    }
-
-    // Sell losers quickly
-    for (const [symbol, position] of Object.entries(portfolio.positions)) {
-      if (quotes[symbol]) {
-        const currentPrice = quotes[symbol].price;
-        const pnlPercent = ((currentPrice - position.avgCost) / position.avgCost) * 100;
-        
-        if (pnlPercent < -5) { // Cut losses at -5%
-          await this.tradingEngine.executeSell(agent.id, symbol, position.shares, currentPrice);
-          console.log(`[${agent.name}] Cut losses: ${symbol} @ ${pnlPercent.toFixed(1)}%`);
+        const result = await this.tradingEngine.executeBuy(agent.id, pick.symbol, shares, pick.price);
+        if (result.success) {
+          this.memory.addObservation(agent.id, {
+            symbol: pick.symbol,
+            observation: `Innovation buy @ $${pick.price.toFixed(2)} | trend:${pick.trend} week:${pick.weekChange.toFixed(1)}% RSI:${pick.rsi.toFixed(0)}`,
+            confidence: 0.7
+          });
+          console.log(`[${agent.name}] 🔮 Growth buy: ${shares} ${pick.symbol} (trend:${pick.trend}, week:${pick.weekChange.toFixed(1)}%)`);
         }
       }
     }
   }
 
-  // Strategy: HODL (buy and hold)
-  async strategyHodl(agent, portfolio, quotes) {
-    // Only buy, never sell (unless forced)
-    const hodlStocks = agent.preferredStocks.filter(s => quotes[s]);
-    
-    if (hodlStocks.length > 0 && portfolio.cash > 1) {
-      const symbol = hodlStocks[Math.floor(Math.random() * hodlStocks.length)];
-      const price = quotes[symbol].price;
-      
-      // Buy on red days (buy the dip!) or just buy if no change data
-      if (!quotes[symbol].changePercent || quotes[symbol].changePercent < 0 || Math.random() > 0.5) {
-        const shares = Math.round((portfolio.cash * 0.5) / price * 10000) / 10000;
+  // Strategy: Momentum - chase winners, dump losers fast
+  async strategyMomentum(agent, portfolio, quotes, movers, analyses) {
+    // Gordon chases the hottest stocks
+    const allAnalyzed = Object.values(analyses).filter(a => a)
+      .map(a => ({
+        ...a,
+        score: (a.dailyChange > 0 ? a.dailyChange * 10 : 0) + // Today's winners
+               (a.weekChange > 0 ? a.weekChange * 3 : 0) + // Weekly momentum
+               (a.trend === 'bullish' ? 20 : -10) +
+               (a.rsi > 50 && a.rsi < 75 ? 15 : -5)
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    if (allAnalyzed.length > 0 && allAnalyzed[0].score > 20 && portfolio.cash > 1) {
+      const pick = allAnalyzed[0];
+      const shares = Math.round((portfolio.cash * 0.4) / pick.price * 10000) / 10000;
+      if (shares > 0) {
+        const result = await this.tradingEngine.executeBuy(agent.id, pick.symbol, shares, pick.price);
+        if (result.success) {
+          this.memory.addObservation(agent.id, {
+            symbol: pick.symbol,
+            observation: `🦈 Chasing momentum @ $${pick.price.toFixed(2)} | daily:+${pick.dailyChange.toFixed(1)}% week:+${pick.weekChange.toFixed(1)}%`,
+            confidence: 0.6
+          });
+          console.log(`[${agent.name}] 🦈 Momentum buy: ${shares} ${pick.symbol} (daily:${pick.dailyChange.toFixed(1)}%, score:${pick.score.toFixed(0)})`);
+        }
+      }
+    }
+  }
+
+  // Strategy: HODL - buy blue chips on dips, almost never sell
+  async strategyHodl(agent, portfolio, quotes, analyses) {
+    const hodlStocks = agent.preferredStocks
+      .filter(s => quotes[s] && analyses[s])
+      .map(s => ({ symbol: s, ...analyses[s] }));
+
+    // Diamond buys when stocks dip - the more they drop, the more excited
+    const dips = hodlStocks.filter(c => c.dailyChange < 0 || c.weekChange < 0)
+      .map(c => ({
+        ...c,
+        score: Math.abs(c.dailyChange) * 10 + // Bigger dip = more buying
+               (c.rsi < 35 ? 30 : c.rsi < 45 ? 15 : 0) + // Oversold = great
+               (c.trend === 'bearish' ? 15 : 0) // Buy when others panic
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    if (dips.length > 0 && portfolio.cash > 1) {
+      const pick = dips[0];
+      const shares = Math.round((portfolio.cash * 0.4) / pick.price * 10000) / 10000;
+      if (shares > 0) {
+        const result = await this.tradingEngine.executeBuy(agent.id, pick.symbol, shares, pick.price);
+        if (result.success) {
+          console.log(`[${agent.name}] 💎🙌 Buying the dip: ${shares} ${pick.symbol} (daily:${pick.dailyChange.toFixed(1)}%, RSI:${pick.rsi.toFixed(0)})`);
+        }
+      }
+    } else if (portfolio.cash > portfolio.startingValue * 0.5) {
+      // If no dips and sitting on lots of cash, buy something blue-chip
+      const safePicks = hodlStocks.filter(c => c.volatility < 2.5).sort((a, b) => a.rsi - b.rsi);
+      if (safePicks.length > 0) {
+        const pick = safePicks[0];
+        const shares = Math.round((portfolio.cash * 0.3) / pick.price * 10000) / 10000;
         if (shares > 0) {
-          await this.tradingEngine.executeBuy(agent.id, symbol, shares, price);
-          console.log(`[${agent.name}] 💎🙌 Buying the dip: ${shares} ${symbol}`);
+          await this.tradingEngine.executeBuy(agent.id, pick.symbol, shares, pick.price);
+          console.log(`[${agent.name}] 💎 Steady buy: ${shares} ${pick.symbol}`);
         }
       }
     }
   }
 
-  // Strategy: Scalping (quick trades)
-  async strategyScalp(agent, portfolio, quotes) {
-    // Use memory to adjust thresholds
+  // Strategy: Scalping - quick in-and-out, uses analysis for timing
+  async strategyScalp(agent, portfolio, quotes, analyses) {
     const winRate = this.memory.getWinRate(agent.id);
-    const profitThreshold = winRate.winRate > 60 ? 1.5 : 2.5; // More aggressive if winning
-    const lossThreshold = winRate.winRate < 40 ? -1.5 : -2; // Tighter stops if losing
+    
+    // Paperhands looks for: low volatility, slight dips, quick bounce potential
+    if (portfolio.cash > 1) {
+      const candidates = TRADEABLE_STOCKS
+        .filter(s => quotes[s] && analyses[s] && !agent.avoidStocks.includes(s))
+        .map(s => ({ symbol: s, ...analyses[s], sentiment: this.memory.getStockSentiment(agent.id, s) }))
+        .map(c => ({
+          ...c,
+          score: (c.dailyChange < 0 && c.dailyChange > -2 ? 25 : 0) +
+                 (c.rsi > 35 && c.rsi < 50 ? 20 : 0) +
+                 (c.trend !== 'bearish' ? 15 : -15) +
+                 (c.volatility < 2 ? 15 : c.volatility > 4 ? -20 : 0) +
+                 (c.sentiment > 0 ? c.sentiment * 20 : c.sentiment * 10)
+        }))
+        .sort((a, b) => b.score - a.score);
 
-    // Quick profit taking
-    for (const [symbol, position] of Object.entries(portfolio.positions)) {
-      if (quotes[symbol]) {
-        const currentPrice = quotes[symbol].price;
-        const pnlPercent = ((currentPrice - position.avgCost) / position.avgCost) * 100;
-        
-        if (pnlPercent > profitThreshold || pnlPercent < lossThreshold) {
-          const result = await this.tradingEngine.executeSell(agent.id, symbol, position.shares, currentPrice);
+      if (candidates.length > 0 && candidates[0].score > 15) {
+        const pick = candidates[0];
+        const shares = Math.round((portfolio.cash * 0.3) / pick.price * 10000) / 10000;
+        if (shares > 0) {
+          const result = await this.tradingEngine.executeBuy(agent.id, pick.symbol, shares, pick.price);
           if (result.success) {
-            // Record in memory
-            this.memory.recordTradeOutcome(agent.id, {
-              symbol, action: 'SELL', entryPrice: position.avgCost, exitPrice: currentPrice,
-              pnl: result.pnl, pnlPercent, reason: pnlPercent > 0 ? 'Take profit' : 'Stop loss',
-              lesson: pnlPercent > 0 ? `${symbol} hit profit target` : `${symbol} hit stop - cut losses quick`
+            this.memory.addObservation(agent.id, {
+              symbol: pick.symbol,
+              observation: `Scalp entry @ $${pick.price.toFixed(2)} | RSI:${pick.rsi.toFixed(0)} vol:${pick.volatility.toFixed(1)}% WinRate:${winRate.winRate.toFixed(0)}%`,
+              confidence: 0.5
             });
-            // Update sentiment
-            this.memory.updateBelief(agent.id, {
-              beliefType: 'stock_sentiment', symbol,
-              value: Math.max(-1, Math.min(1, (this.memory.getStockSentiment(agent.id, symbol) + (pnlPercent > 0 ? 0.2 : -0.3)))),
-              note: `Last trade: ${pnlPercent.toFixed(1)}%`
-            });
-            console.log(`[${agent.name}] 📄 Quick exit: ${symbol} @ ${pnlPercent.toFixed(1)}%`);
+            console.log(`[${agent.name}] 📄 Scalp entry: ${shares} ${pick.symbol} (RSI:${pick.rsi.toFixed(0)}, score:${pick.score.toFixed(0)})`);
           }
         }
       }
     }
-
-    // Quick buy - prefer stocks with good past performance
-    if (portfolio.cash > 1) {
-      const allStocks = TRADEABLE_STOCKS.filter(s => quotes[s] && !agent.avoidStocks.includes(s));
-      // Sort by sentiment from memory
-      allStocks.sort((a, b) => this.memory.getStockSentiment(agent.id, b) - this.memory.getStockSentiment(agent.id, a));
-      
-      const symbol = allStocks[0] || allStocks[Math.floor(Math.random() * allStocks.length)];
-      if (symbol && quotes[symbol]) {
-        const price = quotes[symbol].price;
-        const shares = Math.round((portfolio.cash * 0.3) / price * 10000) / 10000;
-        
-        if (shares > 0) {
-          await this.tradingEngine.executeBuy(agent.id, symbol, shares, price);
-          console.log(`[${agent.name}] Quick entry: ${shares} ${symbol}`);
-        }
-      }
-    }
   }
 
-  // Strategy: Technical analysis
-  async strategyTechnical(agent, portfolio, quotes) {
-    // Simple technical: buy oversold, sell overbought
-    for (const symbol of TRADEABLE_STOCKS) {
-      if (!quotes[symbol]) continue;
-      
-      const quote = quotes[symbol];
-      const distanceFromHigh = ((quote.fiftyTwoWeekHigh - quote.price) / quote.fiftyTwoWeekHigh) * 100;
-      const distanceFromLow = ((quote.price - quote.fiftyTwoWeekLow) / quote.fiftyTwoWeekLow) * 100;
-      
-      // Buy if near 52-week low (oversold)
-      if (distanceFromHigh > 30 && portfolio.cash > 1) {
-        const shares = Math.round((portfolio.cash * 0.2) / quote.price * 10000) / 10000;
-        if (shares > 0) {
-          await this.tradingEngine.executeBuy(agent.id, symbol, shares, quote.price);
-          console.log(`[${agent.name}] 🤖 Technical buy: ${symbol} (${distanceFromHigh.toFixed(0)}% from high)`);
-          break;
+  // Strategy: Technical analysis - pure data, RSI + trend + support/resistance
+  async strategyTechnical(agent, portfolio, quotes, analyses) {
+    const allAnalyzed = TRADEABLE_STOCKS
+      .filter(s => analyses[s])
+      .map(s => ({ symbol: s, ...analyses[s] }));
+
+    const buySignals = allAnalyzed
+      .map(c => ({
+        ...c,
+        score: c.signal +
+               (c.rsi < 30 ? 30 : c.rsi < 40 ? 15 : c.rsi > 70 ? -30 : 0) +
+               (c.price <= c.support * 1.02 ? 25 : 0) +
+               (c.price >= c.resistance * 0.98 ? -25 : 0) +
+               (c.trend === 'bullish' && c.rsi < 60 ? 15 : 0) +
+               (c.aboveWeekAvg && c.aboveMonthAvg ? 10 : -5)
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    if (buySignals.length > 0 && buySignals[0].score > 25 && portfolio.cash > 1) {
+      const pick = buySignals[0];
+      const shares = Math.round((portfolio.cash * 0.25) / pick.price * 10000) / 10000;
+      if (shares > 0) {
+        const result = await this.tradingEngine.executeBuy(agent.id, pick.symbol, shares, pick.price);
+        if (result.success) {
+          this.memory.addObservation(agent.id, {
+            symbol: pick.symbol,
+            observation: `Signal:${pick.signal.toFixed(0)} RSI:${pick.rsi.toFixed(0)} Trend:${pick.trend} Support:$${pick.support.toFixed(2)} Resistance:$${pick.resistance.toFixed(2)} SCORE:${pick.score.toFixed(0)}`,
+            confidence: Math.min(0.9, pick.score / 80)
+          });
+          console.log(`[${agent.name}] 🤖 Technical buy: ${shares} ${pick.symbol} (signal:${pick.score.toFixed(0)}, RSI:${pick.rsi.toFixed(0)}, trend:${pick.trend})`);
         }
       }
-      
-      // Sell if near 52-week high (overbought)
-      if (portfolio.positions[symbol] && distanceFromLow > 50) {
-        const position = portfolio.positions[symbol];
-        await this.tradingEngine.executeSell(agent.id, symbol, position.shares, quote.price);
-        console.log(`[${agent.name}] 🤖 Technical sell: ${symbol} (${distanceFromLow.toFixed(0)}% from low)`);
-      }
+    } else {
+      console.log(`[${agent.name}] 🤖 No strong signals. Top: ${buySignals[0]?.symbol} (score:${buySignals[0]?.score.toFixed(0) || 'N/A'})`);
     }
   }
 

@@ -153,6 +153,128 @@ export class MarketData {
     return nextClose.toISOString();
   }
 
+  // Analyze a stock's trend from its chart data
+  async analyzeStock(symbol) {
+    try {
+      const url = `https://query2.finance.yahoo.com/v8/finance/chart/${symbol}?interval=1d&range=1mo`;
+      const res = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'application/json',
+        }
+      });
+      if (!res.ok) throw new Error(`API error: ${res.status}`);
+      const data = await res.json();
+      const result = data.chart?.result?.[0];
+      if (!result) throw new Error('No data');
+
+      const closes = result.indicators?.quote?.[0]?.close?.filter(c => c != null) || [];
+      if (closes.length < 5) return null;
+
+      const current = closes[closes.length - 1];
+      const prev = closes[closes.length - 2];
+      const week = closes.slice(-5);
+      const twoWeek = closes.slice(-10);
+      const month = closes;
+
+      // Calculate indicators
+      const weekAvg = week.reduce((a, b) => a + b, 0) / week.length;
+      const twoWeekAvg = twoWeek.reduce((a, b) => a + b, 0) / twoWeek.length;
+      const monthAvg = month.reduce((a, b) => a + b, 0) / month.length;
+
+      // Daily change
+      const dailyChange = prev ? ((current - prev) / prev) * 100 : 0;
+      
+      // Week change
+      const weekChange = ((current - week[0]) / week[0]) * 100;
+      
+      // Month change  
+      const monthChange = ((current - month[0]) / month[0]) * 100;
+
+      // Volatility (std dev of daily returns)
+      const returns = [];
+      for (let i = 1; i < closes.length; i++) {
+        returns.push((closes[i] - closes[i-1]) / closes[i-1]);
+      }
+      const avgReturn = returns.reduce((a, b) => a + b, 0) / returns.length;
+      const volatility = Math.sqrt(returns.reduce((sum, r) => sum + Math.pow(r - avgReturn, 2), 0) / returns.length) * 100;
+
+      // Trend direction
+      const aboveWeekAvg = current > weekAvg;
+      const aboveMonthAvg = current > monthAvg;
+      const trend = aboveWeekAvg && aboveMonthAvg ? 'bullish' : 
+                    !aboveWeekAvg && !aboveMonthAvg ? 'bearish' : 'neutral';
+
+      // RSI (simplified 14-day)
+      const gains = returns.slice(-14).filter(r => r > 0);
+      const losses = returns.slice(-14).filter(r => r < 0).map(r => Math.abs(r));
+      const avgGain = gains.length ? gains.reduce((a, b) => a + b, 0) / 14 : 0;
+      const avgLoss = losses.length ? losses.reduce((a, b) => a + b, 0) / 14 : 0;
+      const rs = avgLoss > 0 ? avgGain / avgLoss : 100;
+      const rsi = 100 - (100 / (1 + rs));
+
+      // Support/resistance (recent highs and lows)
+      const recentHighs = result.indicators?.quote?.[0]?.high?.filter(h => h != null).slice(-10) || [];
+      const recentLows = result.indicators?.quote?.[0]?.low?.filter(l => l != null).slice(-10) || [];
+      const resistance = recentHighs.length ? Math.max(...recentHighs) : current * 1.05;
+      const support = recentLows.length ? Math.min(...recentLows) : current * 0.95;
+
+      // Signal score: -100 (strong sell) to +100 (strong buy)
+      let signal = 0;
+      if (trend === 'bullish') signal += 20;
+      if (trend === 'bearish') signal -= 20;
+      if (rsi < 30) signal += 30; // Oversold = buy
+      if (rsi > 70) signal -= 30; // Overbought = sell
+      if (dailyChange < -2) signal += 15; // Big dip = potential buy
+      if (dailyChange > 3) signal -= 10; // Big spike = maybe take profit
+      if (weekChange > 5) signal -= 10; // Overextended
+      if (weekChange < -5) signal += 15; // Beaten down
+
+      return {
+        symbol,
+        price: current,
+        dailyChange,
+        weekChange,
+        monthChange,
+        volatility,
+        trend,
+        rsi,
+        signal,
+        support,
+        resistance,
+        aboveWeekAvg,
+        aboveMonthAvg,
+        weekAvg,
+        monthAvg
+      };
+    } catch (error) {
+      console.error(`[MarketData] Analysis error for ${symbol}:`, error.message);
+      return null;
+    }
+  }
+
+  // Analyze multiple stocks (with caching)
+  async analyzeMultiple(symbols) {
+    const analyses = {};
+    for (const symbol of symbols) {
+      // Use cache key with 'analysis_' prefix
+      const cacheKey = 'analysis_' + symbol;
+      const cached = this.quoteCache.get(cacheKey);
+      if (cached && Date.now() - cached.timestamp < 600000) { // 10 min cache for analysis
+        analyses[symbol] = cached.data;
+        continue;
+      }
+      
+      await this.throttle();
+      const analysis = await this.analyzeStock(symbol);
+      if (analysis) {
+        analyses[symbol] = analysis;
+        this.quoteCache.set(cacheKey, { data: analysis, timestamp: Date.now() });
+      }
+    }
+    return analyses;
+  }
+
   getTradeableStocks() {
     return TRADEABLE_STOCKS;
   }
