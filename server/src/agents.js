@@ -238,10 +238,164 @@ export class AgentManager {
     return agents;
   }
 
+  // Market scan - agents independently decide whether to trade
+  async runMarketScan() {
+    console.log('[Scan] Agents scanning market...');
+    
+    // Get fresh market data and analysis
+    const quotes = await this.marketData.getMultipleQuotes(TRADEABLE_STOCKS);
+    const analyses = await this.marketData.analyzeMultiple(TRADEABLE_STOCKS);
+    const movers = await this.marketData.getTopMovers();
+
+    let tradesThisRound = 0;
+
+    for (const agentId of Object.keys(this.agents)) {
+      const agent = this.agents[agentId];
+      if (agent.status !== 'active') continue;
+
+      try {
+        const portfolio = this.tradingEngine.getPortfolio(agentId);
+        if (!portfolio) continue;
+
+        // Agent decides: should I trade right now?
+        const decision = this.shouldTrade(agent, portfolio, quotes, analyses);
+        
+        if (decision.trade) {
+          console.log(`[${agent.name}] ${decision.reason}`);
+          await this.executeAgentStrategy(agent, quotes, movers, analyses);
+          tradesThisRound++;
+        }
+        
+        // Always record portfolio snapshot
+        const value = await this.tradingEngine.calculatePortfolioValue(agentId, this.marketData);
+        this.tradingEngine.recordPortfolioSnapshot(agentId, value);
+      } catch (error) {
+        console.error(`[Scan] Error for ${agent.name}:`, error.message);
+      }
+    }
+
+    console.log(`[Scan] Complete - ${tradesThisRound} agents traded`);
+  }
+
+  // Each agent independently reasons about whether NOW is a good time to trade
+  shouldTrade(agent, portfolio, quotes, analyses) {
+    const memorySummary = this.memory.getMemorySummary(agent.id);
+    const positions = Object.entries(portfolio.positions);
+    const portfolioValue = portfolio.cash + positions.reduce((sum, [sym, pos]) => {
+      return sum + (quotes[sym] ? pos.shares * quotes[sym].price : pos.shares * pos.avgCost);
+    }, 0);
+    const returnPct = ((portfolioValue - portfolio.startingValue) / portfolio.startingValue) * 100;
+
+    // Check if any current positions need urgent attention (stop-loss, take-profit)
+    for (const [symbol, pos] of positions) {
+      if (!quotes[symbol]) continue;
+      const pnl = ((quotes[symbol].price - pos.avgCost) / pos.avgCost) * 100;
+      
+      // Urgent sells based on personality
+      if (agent.strategy === 'scalp' && (pnl > 1.5 || pnl < -1.5)) {
+        return { trade: true, reason: `📄 Position ${symbol} at ${pnl.toFixed(1)}% - need to act!` };
+      }
+      if (agent.strategy === 'momentum' && pnl < -3) {
+        return { trade: true, reason: `🦈 Cutting loss on ${symbol} (${pnl.toFixed(1)}%)` };
+      }
+      if (pnl < -10 && agent.strategy !== 'hodl') {
+        return { trade: true, reason: `⚠️ ${symbol} down ${pnl.toFixed(1)}% - must act!` };
+      }
+      if (pnl > 15) {
+        return { trade: true, reason: `🎯 ${symbol} up ${pnl.toFixed(1)}% - consider taking profits` };
+      }
+    }
+
+    // Look for opportunities in the market
+    const opportunities = Object.values(analyses).filter(a => a);
+    
+    switch (agent.strategy) {
+      case 'value': {
+        // Warren trades when he sees oversold value stocks
+        const oversold = opportunities.filter(a => a.rsi < 35 && a.trend !== 'bullish');
+        if (oversold.length > 0 && portfolio.cash > 1) {
+          return { trade: true, reason: `🧓 Spotted oversold value: ${oversold[0].symbol} (RSI:${oversold[0].rsi.toFixed(0)})` };
+        }
+        // Also trade if sitting on too much cash with good options
+        if (portfolio.cash > portfolioValue * 0.7 && opportunities.some(a => a.signal > 15)) {
+          return { trade: true, reason: `🧓 Too much cash, deploying capital` };
+        }
+        break;
+      }
+      case 'meme': {
+        // Elon trades when he sees high volatility or big moves
+        const wild = opportunities.filter(a => a.volatility > 3 || Math.abs(a.dailyChange) > 2);
+        if (wild.length > 0 && Math.random() > 0.3) { // Impulsive
+          return { trade: true, reason: `🚀 Volatility detected: ${wild[0].symbol} (vol:${wild[0].volatility.toFixed(1)}%, move:${wild[0].dailyChange.toFixed(1)}%)` };
+        }
+        // Random YOLO urge
+        if (Math.random() > 0.7 && portfolio.cash > 1) {
+          return { trade: true, reason: `🚀 Feeling lucky...` };
+        }
+        break;
+      }
+      case 'growth': {
+        // Cathy trades when growth stocks are trending up
+        const growthPicks = opportunities.filter(a => 
+          agent.preferredStocks.includes(a.symbol) && a.trend === 'bullish' && a.rsi < 65
+        );
+        if (growthPicks.length > 0 && portfolio.cash > 1) {
+          return { trade: true, reason: `🔮 Growth signal: ${growthPicks[0].symbol} (trend:bullish, RSI:${growthPicks[0].rsi.toFixed(0)})` };
+        }
+        break;
+      }
+      case 'momentum': {
+        // Gordon chases hot stocks - trades when something is ripping
+        const hot = opportunities.filter(a => a.dailyChange > 1.5 && a.trend === 'bullish');
+        if (hot.length > 0 && portfolio.cash > 1) {
+          return { trade: true, reason: `🦈 Momentum opportunity: ${hot[0].symbol} (+${hot[0].dailyChange.toFixed(1)}% today)` };
+        }
+        break;
+      }
+      case 'hodl': {
+        // Diamond only buys dips, very selective
+        const bigDips = opportunities.filter(a => a.dailyChange < -1.5 || (a.rsi < 30 && a.weekChange < -3));
+        if (bigDips.length > 0 && portfolio.cash > 1) {
+          return { trade: true, reason: `💎 Dip detected: ${bigDips[0].symbol} (${bigDips[0].dailyChange.toFixed(1)}% today, RSI:${bigDips[0].rsi.toFixed(0)})` };
+        }
+        break;
+      }
+      case 'scalp': {
+        // Paperhands is always looking for quick entries
+        const quickPlays = opportunities.filter(a => 
+          a.dailyChange < 0 && a.dailyChange > -2 && a.rsi > 35 && a.rsi < 50 && a.trend !== 'bearish'
+        );
+        if (quickPlays.length > 0 && portfolio.cash > 1) {
+          return { trade: true, reason: `📄 Quick play: ${quickPlays[0].symbol} (small dip, bounce potential)` };
+        }
+        // Also check if any positions hit scalp targets
+        break;
+      }
+      case 'technical': {
+        // Quant trades on strong signals only
+        const strongSignals = opportunities.filter(a => Math.abs(a.signal) > 30);
+        if (strongSignals.length > 0) {
+          const best = strongSignals.sort((a, b) => Math.abs(b.signal) - Math.abs(a.signal))[0];
+          if (best.signal > 30 && portfolio.cash > 1) {
+            return { trade: true, reason: `🤖 Strong buy signal: ${best.symbol} (signal:${best.signal.toFixed(0)}, RSI:${best.rsi.toFixed(0)})` };
+          }
+        }
+        break;
+      }
+    }
+
+    // Competition pressure - if in danger zone, trade more aggressively
+    if (returnPct < -5 && portfolio.cash > 1) {
+      return { trade: true, reason: `⚠️ Down ${returnPct.toFixed(1)}% - need to make moves!` };
+    }
+
+    return { trade: false, reason: 'No compelling opportunities right now' };
+  }
+
+  // Legacy method for manual triggers
   async runTradingRound() {
     console.log('[Trading] Starting trading round...');
     
-    // Get market data AND analysis for all tradeable stocks
     const quotes = await this.marketData.getMultipleQuotes(TRADEABLE_STOCKS);
     const analyses = await this.marketData.analyzeMultiple(TRADEABLE_STOCKS);
     const movers = await this.marketData.getTopMovers();
@@ -253,7 +407,6 @@ export class AgentManager {
       try {
         await this.executeAgentStrategy(agent, quotes, movers, analyses);
         
-        // Record portfolio snapshot
         const value = await this.tradingEngine.calculatePortfolioValue(agentId, this.marketData);
         this.tradingEngine.recordPortfolioSnapshot(agentId, value);
       } catch (error) {

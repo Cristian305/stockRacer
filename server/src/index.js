@@ -161,12 +161,11 @@ app.get('*', (req, res) => {
 
 // ============ SCHEDULED TASKS ============
 
-// Trading round every 30 minutes during market hours (9:30 AM - 4:00 PM ET, Mon-Fri)
-// Cron runs in server timezone (UTC), so 9:30 AM ET = 14:30 UTC (or 13:30 during DST)
-cron.schedule('*/30 9-16 * * 1-5', async () => {
+// Market scan every 5 minutes during market hours - agents decide if they want to trade
+cron.schedule('*/5 9-16 * * 1-5', async () => {
   if (marketData.isMarketOpen()) {
-    console.log('[CRON] Running trading round...');
-    await agentManager.runTradingRound();
+    console.log('[SCAN] Market scan starting...');
+    await agentManager.runMarketScan();
   }
 }, { timezone: 'America/New_York' });
 
