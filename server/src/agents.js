@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { TRADEABLE_STOCKS } from './market-data.js';
+import { TRADEABLE_STOCKS, SECTORS } from './market-data.js';
 import { AgentMemory } from './agent-memory.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -21,8 +21,8 @@ const AGENT_TEMPLATES = {
     strategy: 'value',
     riskTolerance: 0.3,
     tradeFrequency: 0.3, // Less frequent trades
-    preferredStocks: ['JNJ', 'KO', 'PG', 'JPM', 'BAC', 'WMT', 'XOM', 'CVX'],
-    avoidStocks: ['GME', 'AMC', 'RIVN', 'LCID']
+    preferredStocks: [...SECTORS.finance, ...SECTORS.consumer, ...SECTORS.energy, ...SECTORS.healthcare, ...SECTORS.utilities],
+    avoidStocks: [...SECTORS.meme]
   },
   elon: {
     name: 'Elon',
@@ -32,8 +32,8 @@ const AGENT_TEMPLATES = {
     strategy: 'meme',
     riskTolerance: 0.9,
     tradeFrequency: 0.85,
-    preferredStocks: ['TSLA', 'GME', 'AMC', 'PLTR', 'NVDA'],
-    avoidStocks: []
+    preferredStocks: [...SECTORS.meme, ...SECTORS.growth, 'TSLA', 'NVDA', 'AMD', 'COIN', 'MSTR'],
+    avoidStocks: [...SECTORS.utilities, ...SECTORS.realestate]
   },
   cathy: {
     name: 'Cathy',
@@ -43,8 +43,8 @@ const AGENT_TEMPLATES = {
     strategy: 'growth',
     riskTolerance: 0.7,
     tradeFrequency: 0.6,
-    preferredStocks: ['TSLA', 'SHOP', 'NET', 'PLTR', 'NVDA', 'CRM'],
-    avoidStocks: ['XOM', 'CVX', 'KO']
+    preferredStocks: [...SECTORS.tech, ...SECTORS.growth, 'TSLA', 'NVDA', 'AMD', 'CRWD', 'PANW'],
+    avoidStocks: [...SECTORS.energy, ...SECTORS.utilities]
   },
   gordon: {
     name: 'Gordon',
@@ -65,8 +65,8 @@ const AGENT_TEMPLATES = {
     strategy: 'hodl',
     riskTolerance: 0.6,
     tradeFrequency: 0.2, // Rarely trades, just holds
-    preferredStocks: ['SPY', 'QQQ', 'AAPL', 'MSFT', 'GOOGL', 'AMZN'],
-    avoidStocks: []
+    preferredStocks: [...SECTORS.etfs, 'AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'JPM', 'V', 'UNH', 'JNJ'],
+    avoidStocks: [...SECTORS.meme]
   },
   paperhands: {
     name: 'Paperhands',
@@ -238,20 +238,15 @@ export class AgentManager {
     return agents;
   }
 
-  // Fast market scan - uses cached analysis, only fetches fresh quotes
+  // Live market scan - uses only cached data, zero latency
   async runMarketScan() {
-    // Get fresh quotes (fast - uses 5min cache)
-    const quotes = await this.marketData.getMultipleQuotes(TRADEABLE_STOCKS);
-    
-    // Use cached analysis (refreshed every 10 min by deep scan)
-    const analyses = {};
-    for (const symbol of TRADEABLE_STOCKS) {
-      const cacheKey = 'analysis_' + symbol;
-      const cached = this.marketData.quoteCache.get(cacheKey);
-      if (cached) analyses[symbol] = cached.data;
-    }
-    
+    // All data from cache - instant
+    const quotes = this.marketData.getCachedQuotes();
+    const analyses = this.marketData.getCachedAnalyses();
     const movers = await this.marketData.getTopMovers();
+    
+    // Need at least some data to work with
+    if (Object.keys(quotes).length < 10) return;
 
     let tradesThisRound = 0;
 

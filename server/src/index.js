@@ -78,7 +78,10 @@ app.get('/api/market/status', (req, res) => {
   res.json({
     isOpen: marketData.isMarketOpen(),
     nextOpen: marketData.getNextMarketOpen(),
-    nextClose: marketData.getNextMarketClose()
+    nextClose: marketData.getNextMarketClose(),
+    totalStocks: marketData.getStockCount(),
+    cachedStocks: marketData.getCachedCount(),
+    liveScanning: marketData.isRotating || false
   });
 });
 
@@ -166,7 +169,24 @@ app.get('*', (req, res) => {
 
 // ============ SCHEDULED TASKS ============
 
-// Quick market scan every 30 seconds during market hours
+// ===== LIVE TRADING SYSTEM =====
+
+// Start live quote scanning when market opens
+let liveStarted = false;
+setInterval(() => {
+  if (marketData.isMarketOpen() && !liveStarted) {
+    marketData.startLiveScanning();
+    liveStarted = true;
+    console.log('🔴 LIVE MODE ACTIVATED');
+  } else if (!marketData.isMarketOpen() && liveStarted) {
+    marketData.stopLiveScanning();
+    liveStarted = false;
+    console.log('⚪ Market closed - live scanning paused');
+  }
+}, 10000);
+
+// Agent trading scan - continuous during market hours
+// Agents check cached data and trade when they see opportunities
 let scanRunning = false;
 setInterval(async () => {
   if (!marketData.isMarketOpen() || scanRunning) return;
@@ -177,15 +197,17 @@ setInterval(async () => {
     console.error('[SCAN] Error:', e.message);
   }
   scanRunning = false;
-}, 30000);
+}, 5000); // Agents scan every 5 seconds using cached data
 
-// Full deep analysis every 10 minutes (refreshes cached analysis)
-cron.schedule('*/10 9-16 * * 1-5', async () => {
-  if (marketData.isMarketOpen()) {
-    console.log('[DEEP] Refreshing full market analysis...');
-    await marketData.analyzeMultiple(marketData.getTradeableStocks());
+// Deep analysis refresh every 2 minutes (rotating batches)
+setInterval(async () => {
+  if (!marketData.isMarketOpen()) return;
+  try {
+    await marketData.analyzeNextBatch(15); // 15 stocks per batch = full rotation in ~30 batches
+  } catch (e) {
+    console.error('[Analysis] Batch error:', e.message);
   }
-}, { timezone: 'America/New_York' });
+}, 120000); // Every 2 minutes
 
 // Daily summary at 5 PM ET
 cron.schedule('0 17 * * 1-5', async () => {
