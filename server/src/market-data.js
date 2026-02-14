@@ -56,7 +56,7 @@ async function fetchYahooQuote(symbol) {
 export class MarketData {
   constructor() {
     this.quoteCache = new Map();
-    this.cacheTTL = 300000; // 5 minute cache
+    this.cacheTTL = 30000; // 30 second cache for fast scans
     this.lastRequestTime = 0;
     this.minRequestInterval = 500;
   }

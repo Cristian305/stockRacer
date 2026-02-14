@@ -166,11 +166,24 @@ app.get('*', (req, res) => {
 
 // ============ SCHEDULED TASKS ============
 
-// Market scan every 5 minutes during market hours - agents decide if they want to trade
-cron.schedule('*/5 9-16 * * 1-5', async () => {
-  if (marketData.isMarketOpen()) {
-    console.log('[SCAN] Market scan starting...');
+// Quick market scan every 30 seconds during market hours
+let scanRunning = false;
+setInterval(async () => {
+  if (!marketData.isMarketOpen() || scanRunning) return;
+  scanRunning = true;
+  try {
     await agentManager.runMarketScan();
+  } catch (e) {
+    console.error('[SCAN] Error:', e.message);
+  }
+  scanRunning = false;
+}, 30000);
+
+// Full deep analysis every 10 minutes (refreshes cached analysis)
+cron.schedule('*/10 9-16 * * 1-5', async () => {
+  if (marketData.isMarketOpen()) {
+    console.log('[DEEP] Refreshing full market analysis...');
+    await marketData.analyzeMultiple(marketData.getTradeableStocks());
   }
 }, { timezone: 'America/New_York' });
 

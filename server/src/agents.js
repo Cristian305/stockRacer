@@ -238,13 +238,19 @@ export class AgentManager {
     return agents;
   }
 
-  // Market scan - agents independently decide whether to trade
+  // Fast market scan - uses cached analysis, only fetches fresh quotes
   async runMarketScan() {
-    console.log('[Scan] Agents scanning market...');
-    
-    // Get fresh market data and analysis
+    // Get fresh quotes (fast - uses 5min cache)
     const quotes = await this.marketData.getMultipleQuotes(TRADEABLE_STOCKS);
-    const analyses = await this.marketData.analyzeMultiple(TRADEABLE_STOCKS);
+    
+    // Use cached analysis (refreshed every 10 min by deep scan)
+    const analyses = {};
+    for (const symbol of TRADEABLE_STOCKS) {
+      const cacheKey = 'analysis_' + symbol;
+      const cached = this.marketData.quoteCache.get(cacheKey);
+      if (cached) analyses[symbol] = cached.data;
+    }
+    
     const movers = await this.marketData.getTopMovers();
 
     let tradesThisRound = 0;
